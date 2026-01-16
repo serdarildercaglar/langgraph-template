@@ -1,7 +1,7 @@
 """Configuration module."""
 
 from config.settings import (
-    AuthSettings,
+    APISettings,
     CheckpointSettings,
     EmbeddingSettings,
     Environment,
@@ -13,7 +13,7 @@ from config.settings import (
 )
 
 __all__ = [
-    "AuthSettings",
+    "APISettings",
     "CheckpointSettings",
     "EmbeddingSettings",
     "Environment",

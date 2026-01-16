@@ -1,9 +1,7 @@
-"""LLM module - vLLM client and utilities."""
+"""LLM module - vLLM client."""
 
-from llm.vllm_client import VLLMClient, create_vllm_client, get_chat_model
+from llm.vllm_client import get_chat_model
 
 __all__ = [
-    "VLLMClient",
-    "create_vllm_client",
     "get_chat_model",
 ]

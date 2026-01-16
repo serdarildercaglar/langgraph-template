@@ -18,8 +18,6 @@ from guardrails.builtin import (
     pii_input_check,
     # Output guardrails
     pii_output_check,
-    hallucination_check,
-    off_topic_check,
 )
 
 __all__ = [
@@ -36,6 +34,4 @@ __all__ = [
     "pii_input_check",
     # Built-in output
     "pii_output_check",
-    "hallucination_check",
-    "off_topic_check",
 ]
