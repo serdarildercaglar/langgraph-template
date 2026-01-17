@@ -143,3 +143,96 @@ class ErrorResponse(BaseModel):
     code: str = Field(default="internal_error")
     details: dict[str, Any] = Field(default_factory=dict)
     timestamp: float = Field(default_factory=time.time)
+
+
+# =============================================================================
+# RAG / Retrieve Models
+# =============================================================================
+
+
+class SearchRequest(BaseModel):
+    """Single collection search request."""
+    collection: str = Field(..., description="Collection name")
+    queries: list[str] = Field(..., min_length=1, description="Search queries")
+    dense_fields: list[str] = Field(default_factory=list, description="Dense vector fields")
+    fts_fields: list[str] = Field(default_factory=list, description="FTS/BM25 sparse fields")
+    top_k: int = Field(default=5, ge=1, le=100, description="Results per query")
+    filter: str | None = Field(default=None, description="Pre-filter expression")
+    rerank: Literal["rrf", "weighted"] = Field(default="rrf", description="Reranking strategy")
+    weights: list[float] | None = Field(default=None, description="Weights for weighted rerank")
+
+    def model_post_init(self, __context: Any) -> None:
+        if not self.dense_fields and not self.fts_fields:
+            raise ValueError("At least one of dense_fields or fts_fields required")
+
+
+class RetrieveRequest(BaseModel):
+    """
+    Retrieve request payload. Supports single/multi collection and single/multi query.
+
+    Examples:
+        # Single collection, single query
+        {
+            "requests": [{
+                "collection": "docs",
+                "queries": ["how to authenticate"],
+                "dense_fields": ["content_vector"]
+            }]
+        }
+
+        # Single collection, multiple queries (batch)
+        {
+            "requests": [{
+                "collection": "docs",
+                "queries": ["OAuth setup", "JWT token", "API key"],
+                "dense_fields": ["content_vector"],
+                "fts_fields": ["content_sparse"],
+                "filter": "category == 'api'"
+            }]
+        }
+
+        # Multiple collections (parallel search)
+        {
+            "requests": [
+                {
+                    "collection": "docs",
+                    "queries": ["authentication"],
+                    "dense_fields": ["content_vector"]
+                },
+                {
+                    "collection": "faq",
+                    "queries": ["authentication"],
+                    "dense_fields": ["question_vector"]
+                }
+            ]
+        }
+    """
+    requests: list[SearchRequest] = Field(..., min_length=1)
+
+
+class Hit(BaseModel):
+    """Single search hit."""
+    id: str
+    score: float
+    content: str = ""
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class QueryResult(BaseModel):
+    """Results for a single query."""
+    query: str
+    hits: list[Hit]
+
+
+class CollectionResult(BaseModel):
+    """Results for a single collection."""
+    collection: str
+    results: list[QueryResult]
+    search_type: Literal["dense", "fts", "hybrid"]
+
+
+class RetrieveResponse(BaseModel):
+    """Retrieve response payload."""
+    collections: list[CollectionResult]
+    total_hits: int
+    latency_ms: float

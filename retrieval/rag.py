@@ -1,228 +1,276 @@
 """
-RAG (Retrieval Augmented Generation) pipeline.
-Integrates embedding service and Milvus for document retrieval.
+RAG pipeline with dense vectors, FTS (BM25), and hybrid search.
 """
 
+import json
 import uuid
-from typing import Any
+from pathlib import Path
+from typing import Any, Literal
 
 from retrieval.embeddings import EmbeddingService, get_embedding_service
-from retrieval.milvus_client import AsyncMilvusClient, get_milvus_client
+from retrieval.milvus_client import AsyncMilvusClient, build_schema, get_milvus_client
 
 
 class RAGPipeline:
-    """
-    RAG pipeline for document ingestion and retrieval.
-    Provides a high-level interface for RAG operations.
-    """
-    
+    """RAG pipeline for document ingestion and retrieval."""
+
     def __init__(
         self,
-        collection_name: str | None = None,
+        collection_name: str,
         embedding_service: EmbeddingService | None = None,
         milvus_client: AsyncMilvusClient | None = None,
     ):
-        from config.settings import get_settings
-        
-        settings = get_settings()
-        self.collection_name = collection_name or settings.milvus.collection_name
+        self.collection_name = collection_name
         self._embedding_service = embedding_service
         self._milvus_client = milvus_client
-    
+
     @property
     def embeddings(self) -> EmbeddingService:
         if self._embedding_service is None:
             self._embedding_service = get_embedding_service()
         return self._embedding_service
-    
+
     @property
     def milvus(self) -> AsyncMilvusClient:
         if self._milvus_client is None:
             self._milvus_client = get_milvus_client()
         return self._milvus_client
-    
-    async def initialize(self) -> None:
+
+    async def initialize(
+        self,
+        dense_fields: list[dict[str, Any]],
+        fts_fields: list[dict[str, Any]] | None = None,
+        partition_key: str | None = None,
+    ) -> None:
         """
-        Initialize the RAG pipeline.
-        Creates collection if it doesn't exist.
+        Create collection with schema.
+
+        Args:
+            dense_fields: Dense vector configs (name, source, dim, metric)
+            fts_fields: FTS/BM25 configs (name, source, analyzer)
+            partition_key: Field for partition key
         """
+        default_dim = self.embeddings.dimension
+        for df in dense_fields:
+            if "dim" not in df:
+                df["dim"] = default_dim
+
+        schema, index_params = build_schema(dense_fields, fts_fields, partition_key)
         await self.milvus.create_collection(
             collection_name=self.collection_name,
-            dimension=self.embeddings.dimension,
+            schema=schema,
+            index_params=index_params,
         )
-    
-    async def ingest_documents(
+
+    async def ingest(
         self,
         documents: list[dict[str, Any]],
-        id_field: str = "id",
-        content_field: str = "content",
-        metadata_fields: list[str] | None = None,
+        dense_fields: list[dict[str, Any]],
+        fts_fields: list[dict[str, Any]] | None = None,
+        partition_key: str | None = None,
+        required_fields: list[str] | None = None,
     ) -> dict[str, Any]:
         """
-        Ingest documents into the RAG system.
-        
+        Ingest documents with dense embeddings. FTS fields are auto-indexed by Milvus.
+
         Args:
-            documents: List of document dicts
-            id_field: Field containing document ID (auto-generated if missing)
-            content_field: Field containing text content
-            metadata_fields: Fields to include in metadata
-        
-        Returns:
-            Ingestion result with counts
+            documents: List of documents
+            dense_fields: Dense vector configs (name, source)
+            fts_fields: FTS configs (name, source) - text copied, Milvus tokenizes
+            partition_key: Partition key field name
+            required_fields: Fields that must be non-empty (default: ["content"])
         """
-        # Prepare documents
+        fts_fields = fts_fields or []
+        required_fields = required_fields or ["content"]
+
+        # Validate required fields
+        for i, doc in enumerate(documents):
+            for field in required_fields:
+                value = doc.get(field)
+                if not value or (isinstance(value, str) and not value.strip()):
+                    raise ValueError(f"Document {i} missing required field: {field}")
+
+        # Collect source fields for dense embeddings
+        dense_sources = {df["name"]: df["source"] for df in dense_fields}
+
+        # Collect source fields for FTS (just need to copy text)
+        fts_sources = {ff["source"] for ff in fts_fields}
+
+        # All source fields
+        all_sources = set(dense_sources.values()) | fts_sources
+
+        # Embed dense fields (handle empty/None by using empty string placeholder)
+        embeddings_by_field: dict[str, list[list[float]]] = {}
+        for vec_name, source in dense_sources.items():
+            # Use empty string for None/empty values
+            texts = [doc.get(source) or "" for doc in documents]
+            embeddings_by_field[vec_name] = await self.embeddings.embed_batch(texts)
+
+        # Build records
         prepared = []
-        for doc in documents:
-            doc_id = doc.get(id_field) or str(uuid.uuid4())
-            content = doc[content_field]
-            
-            # Extract metadata
-            metadata = {}
-            if metadata_fields:
-                metadata = {k: doc.get(k) for k in metadata_fields if k in doc}
-            
-            prepared.append({
-                "id": doc_id,
-                "content": content,
-                "metadata": metadata,
-            })
-        
-        # Generate embeddings
-        texts = [d["content"] for d in prepared]
-        embeddings = await self.embeddings.embed_batch(texts)
-        
-        # Add embeddings to documents
-        for doc, embedding in zip(prepared, embeddings):
-            doc["vector"] = embedding
-        
-        # Insert into Milvus
-        result = await self.milvus.insert_batch(
-            collection_name=self.collection_name,
-            documents=prepared,
-        )
-        
-        return result
-    
-    async def retrieve(
+        for i, doc in enumerate(documents):
+            record = {"id": doc.get("id") or str(uuid.uuid4())}
+
+            # Copy source text fields (use empty string for None/empty)
+            for source in all_sources:
+                value = doc.get(source)
+                record[source] = value if value else ""
+
+            # Add partition key
+            if partition_key and partition_key in doc:
+                record[partition_key] = doc[partition_key]
+
+            # Add dense vectors
+            for vec_name in dense_sources:
+                record[vec_name] = embeddings_by_field[vec_name][i]
+
+            # FTS sparse vectors are auto-generated by Milvus BM25 function
+
+            prepared.append(record)
+
+        return await self.milvus.insert_batch(self.collection_name, prepared)
+
+    async def search_dense(
         self,
         query: str,
+        vector_field: str,
         top_k: int = 5,
         filter_expr: str | None = None,
-        min_score: float | None = None,
     ) -> list[dict[str, Any]]:
-        """
-        Retrieve relevant documents for a query.
-        
-        Args:
-            query: Search query
-            top_k: Number of results to return
-            filter_expr: Milvus filter expression
-            min_score: Minimum similarity score threshold
-        
-        Returns:
-            List of relevant documents with scores
-        """
-        # Embed query
+        """Semantic search on dense vector field."""
         query_embedding = await self.embeddings.embed(query)
-        
-        # Search Milvus
+
         results = await self.milvus.search(
             collection_name=self.collection_name,
             query_vectors=[query_embedding],
+            anns_field=vector_field,
             top_k=top_k,
             filter_expr=filter_expr,
         )
-        
-        # Get first query's results
-        docs = results[0] if results else []
-        
-        # Apply minimum score filter
-        if min_score is not None:
-            docs = [d for d in docs if d["score"] >= min_score]
-        
-        return docs
-    
-    async def retrieve_batch(
+
+        return results[0] if results else []
+
+    async def search_fts(
         self,
-        queries: list[str],
+        query: str,
+        sparse_field: str,
         top_k: int = 5,
-        **kwargs,
-    ) -> list[list[dict[str, Any]]]:
-        """
-        Retrieve documents for multiple queries.
-        
-        Args:
-            queries: List of search queries
-            top_k: Number of results per query
-        
-        Returns:
-            List of results per query
-        """
-        # Embed all queries
-        query_embeddings = await self.embeddings.embed_batch(queries)
-        
-        # Search Milvus
-        results = await self.milvus.search_batch(
+        filter_expr: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Full-text search on sparse/BM25 field."""
+        results = await self.milvus.search(
             collection_name=self.collection_name,
-            query_vectors=query_embeddings,
+            query_vectors=[query],  # Raw text for BM25
+            anns_field=sparse_field,
             top_k=top_k,
-            **kwargs,
+            filter_expr=filter_expr,
         )
-        
-        return results
-    
-    def format_context(
+
+        return results[0] if results else []
+
+    async def search_hybrid(
         self,
-        documents: list[dict[str, Any]],
-        max_length: int | None = None,
-    ) -> str:
+        query: str,
+        dense_fields: list[str],
+        fts_fields: list[str] | None = None,
+        top_k: int = 5,
+        filter_expr: str | None = None,
+        rerank: Literal["rrf", "weighted"] = "rrf",
+        weights: list[float] | None = None,
+    ) -> list[dict[str, Any]]:
         """
-        Format retrieved documents as context string.
-        
+        Hybrid search across dense and FTS fields.
+
         Args:
-            documents: Retrieved documents
-            max_length: Maximum context length (chars)
-        
-        Returns:
-            Formatted context string
+            query: Search query
+            dense_fields: Dense vector fields
+            fts_fields: FTS/BM25 sparse fields
+            top_k: Number of results
+            filter_expr: Pre-filter
+            rerank: "rrf" or "weighted"
+            weights: Weights for weighted rerank
         """
-        context_parts = []
-        total_length = 0
-        
-        for i, doc in enumerate(documents, 1):
-            content = doc.get("content", "")
-            score = doc.get("score", 0)
-            
-            part = f"[Document {i}] (relevance: {score:.2f})\n{content}\n"
-            
-            if max_length and total_length + len(part) > max_length:
-                break
-            
-            context_parts.append(part)
-            total_length += len(part)
-        
-        return "\n".join(context_parts)
-    
-    async def delete_documents(
+        fts_fields = fts_fields or []
+        query_embedding = await self.embeddings.embed(query)
+
+        requests = []
+
+        # Dense requests
+        for field in dense_fields:
+            requests.append({
+                "data": [query_embedding],
+                "anns_field": field,
+                "params": {"metric_type": "COSINE"},
+            })
+
+        # FTS requests
+        for field in fts_fields:
+            requests.append({
+                "data": [query],  # Raw text
+                "anns_field": field,
+                "params": {"metric_type": "BM25"},
+            })
+
+        return await self.milvus.hybrid_search(
+            collection_name=self.collection_name,
+            requests=requests,
+            top_k=top_k,
+            filter_expr=filter_expr,
+            rerank=rerank,
+            weights=weights,
+        )
+
+    async def delete(
         self,
         ids: list[str] | None = None,
         filter_expr: str | None = None,
     ) -> dict[str, Any]:
-        """Delete documents by IDs or filter."""
-        return await self.milvus.delete(
-            collection_name=self.collection_name,
-            ids=ids,
-            filter_expr=filter_expr,
+        """Delete documents."""
+        return await self.milvus.delete(self.collection_name, ids=ids, filter_expr=filter_expr)
+
+
+async def load_from_json(json_path: str | Path) -> dict[str, RAGPipeline]:
+    """
+    Load collections from JSON config and ingest documents.
+
+    Args:
+        json_path: Path to collections JSON file
+
+    Returns:
+        Dict of collection_name -> RAGPipeline
+    """
+    with open(json_path) as f:
+        config = json.load(f)
+
+    pipelines: dict[str, RAGPipeline] = {}
+
+    for coll in config:
+        name = coll["collection"]
+        partition_key = coll.get("partition_key")
+        dense_fields = coll.get("fields", {}).get("dense", [])
+        fts_fields = coll.get("fields", {}).get("fts", [])
+        documents = coll.get("documents", [])
+        required_fields = coll.get("required_fields")  # Optional, defaults to ["content"]
+
+        pipeline = RAGPipeline(collection_name=name)
+
+        # Create collection
+        await pipeline.initialize(
+            dense_fields=dense_fields,
+            fts_fields=fts_fields,
+            partition_key=partition_key,
         )
 
+        # Ingest documents
+        if documents:
+            await pipeline.ingest(
+                documents=documents,
+                dense_fields=dense_fields,
+                fts_fields=fts_fields,
+                partition_key=partition_key,
+                required_fields=required_fields,
+            )
 
-# Module-level singleton
-_pipeline: RAGPipeline | None = None
+        pipelines[name] = pipeline
 
-
-def get_rag_pipeline(collection_name: str | None = None) -> RAGPipeline:
-    """Get or create the RAG pipeline."""
-    global _pipeline
-    if _pipeline is None or (collection_name and _pipeline.collection_name != collection_name):
-        _pipeline = RAGPipeline(collection_name=collection_name)
-    return _pipeline
+    return pipelines

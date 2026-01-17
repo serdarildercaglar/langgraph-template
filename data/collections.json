@@ -1,0 +1,57 @@
+[
+  {
+    "collection": "technical_docs",
+    "partition_key": "category",
+    "fields": {
+      "dense": [
+        {"name": "title_vector", "source": "title", "dim": 1024, "metric": "COSINE"},
+        {"name": "content_vector", "source": "content", "dim": 1024, "metric": "COSINE"}
+      ],
+      "fts": [
+        {"name": "content_sparse", "source": "content", "analyzer": "standard"}
+      ]
+    },
+    "documents": [
+      {
+        "id": "doc1",
+        "title": "API Authentication Guide",
+        "content": "This guide explains how to authenticate with our API using OAuth2 and JWT tokens.",
+        "category": "api"
+      },
+      {
+        "id": "doc2",
+        "title": "Database Setup",
+        "content": "Configure your PostgreSQL database with proper indexing and connection pooling.",
+        "category": "setup"
+      }
+    ]
+  },
+  {
+    "collection": "faq",
+    "partition_key": "topic",
+    "fields": {
+      "dense": [
+        {"name": "question_vector", "source": "question", "dim": 1024, "metric": "COSINE"},
+        {"name": "answer_vector", "source": "answer", "dim": 1024, "metric": "COSINE"}
+      ],
+      "fts": [
+        {"name": "question_sparse", "source": "question", "analyzer": "english"},
+        {"name": "answer_sparse", "source": "answer", "analyzer": "english"}
+      ]
+    },
+    "documents": [
+      {
+        "id": "faq1",
+        "question": "How do I reset my password?",
+        "answer": "Go to settings, click on security, and select reset password option.",
+        "topic": "account"
+      },
+      {
+        "id": "faq2",
+        "question": "What payment methods are supported?",
+        "answer": "We support credit cards, PayPal, and bank transfers.",
+        "topic": "billing"
+      }
+    ]
+  }
+]
