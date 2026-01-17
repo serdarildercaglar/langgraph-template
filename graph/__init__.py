@@ -1,6 +1,6 @@
 """Graph module - LangGraph utilities."""
 
-from graph.builder import create_agent, get_checkpointer
+from graph.builder import create_agent
 from graph.state import MessagesState, RAGState
 
 __all__ = [
@@ -9,5 +9,4 @@ __all__ = [
     "RAGState",
     # Builder
     "create_agent",
-    "get_checkpointer",
 ]

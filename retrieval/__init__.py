@@ -2,8 +2,6 @@
 
 from retrieval.embeddings import (
     EmbeddingService,
-    embed_text,
-    embed_texts,
     get_embedding_service,
 )
 from retrieval.milvus_client import (
@@ -18,8 +16,6 @@ from retrieval.rag import (
 __all__ = [
     # Embeddings
     "EmbeddingService",
-    "embed_text",
-    "embed_texts",
     "get_embedding_service",
     # Milvus
     "AsyncMilvusClient",

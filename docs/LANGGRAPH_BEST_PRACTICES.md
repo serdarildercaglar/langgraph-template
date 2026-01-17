@@ -172,30 +172,39 @@ Standart agent için `MessagesState` (LangGraph built-in) kullanıyoruz.
 ### ✅ Önerilen: Tool-Based Handoff
 
 ```python
-from langgraph.prebuilt import create_react_agent
+from graph.builder import create_agent
+from langchain_core.tools import tool
 
-# Sub-agent'ı tool olarak tanımla
-def call_research_agent(query: str) -> str:
+# Sub-agent'ı tool olarak tanımla (Langfuse'dan prompt çeker)
+@tool
+async def call_research_agent(query: str) -> str:
     """Derinlemesine araştırma için research agent'ı çağır."""
-    research_agent = create_react_agent(model, research_tools)
-    result = research_agent.invoke({"messages": [HumanMessage(content=query)]})
+    research_agent = await create_agent(
+        tools=research_tools,
+        langfuse_prompt_name="research-agent",  # Langfuse'dan prompt çek
+    )
+    result = await research_agent.ainvoke({"messages": [HumanMessage(content=query)]})
     return result["messages"][-1].content
 
-def call_code_agent(task: str) -> str:
+@tool
+async def call_code_agent(task: str) -> str:
     """Kod yazma görevi için code agent'ı çağır."""
-    code_agent = create_react_agent(model, code_tools)
-    result = code_agent.invoke({"messages": [HumanMessage(content=task)]})
+    code_agent = await create_agent(
+        tools=code_tools,
+        langfuse_prompt_name="code-agent",  # Langfuse'dan prompt çek
+    )
+    result = await code_agent.ainvoke({"messages": [HumanMessage(content=task)]})
     return result["messages"][-1].content
 
 # Ana agent tüm sub-agent'ları tool olarak kullanır
-main_agent = create_react_agent(
-    model=model,
+main_agent = await create_agent(
     tools=[
         call_research_agent,
         call_code_agent,
         regular_tool_1,
         regular_tool_2,
     ],
+    langfuse_prompt_name="main-assistant",
 )
 ```
 
@@ -204,6 +213,11 @@ main_agent = create_react_agent(
 - Her tool call izole context'te
 - Langfuse'da net trace'ler
 - Supervisor state yönetimi yok
+- **Her sub-agent kendi Langfuse prompt'unu kullanır** (versiyon kontrolü, A/B test)
+
+> **Not:** Sub-agent prompt'ları Langfuse'da tanımlanmalıdır:
+> - `research-agent`: Araştırma uzmanı rolü, kaynak gösterme formatı
+> - `code-agent`: Kod yazma uzmanı rolü, kod standartları
 
 ### Ne Zaman Multi-Agent Gerekir?
 

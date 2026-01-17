@@ -21,12 +21,24 @@ from api.models import (
     AudioContent,
     VideoContent,
 )
+from graph import create_agent
+from guardrails import (
+    create_input_guardrail,
+    create_output_guardrail,
+    prompt_injection_check,
+    toxic_content_check,
+    pii_output_check,
+)
 from observability import create_trace_handler
+from tools import get_all_tools
 
 router = APIRouter(prefix="/api/v1", tags=["v1"])
 
+# Graph singleton
+_compiled_graph = None
 
-def convert_content_to_langchain(content: str | list[ContentPart]) -> str | list[dict[str, Any]]:
+
+def _convert_content(content: str | list[ContentPart]) -> str | list[dict[str, Any]]:
     """Convert API content format to LangChain message content format."""
     if isinstance(content, str):
         return content
@@ -41,63 +53,42 @@ def convert_content_to_langchain(content: str | list[ContentPart]) -> str | list
                 "image_url": {"url": part.image_url.url, "detail": part.image_url.detail}
             })
         elif isinstance(part, AudioContent):
-            result.append({
-                "type": "audio_url",
-                "audio_url": {"url": part.audio_url.url}
-            })
+            result.append({"type": "audio_url", "audio_url": {"url": part.audio_url.url}})
         elif isinstance(part, VideoContent):
-            result.append({
-                "type": "video_url",
-                "video_url": {"url": part.video_url.url}
-            })
+            result.append({"type": "video_url", "video_url": {"url": part.video_url.url}})
     return result
 
 
-def convert_messages_to_langchain(messages: list) -> list:
+def _to_langchain_messages(messages: list) -> list:
     """Convert API messages to LangChain message objects."""
-    result = []
-    for msg in messages:
-        content = convert_content_to_langchain(msg.content)
-        if msg.role == "user":
-            result.append(HumanMessage(content=content))
-        elif msg.role == "assistant":
-            result.append(AIMessage(content=content))
-        elif msg.role == "system":
-            result.append(SystemMessage(content=content))
-    return result
+    msg_map = {"user": HumanMessage, "assistant": AIMessage, "system": SystemMessage}
+    return [msg_map[m.role](content=_convert_content(m.content)) for m in messages]
 
 
-# Graph singleton
-_compiled_graph = None
+def _create_invoke_config(request: ChatRequest) -> dict:
+    """Create config dict for graph invocation."""
+    handler = create_trace_handler(
+        session_id=request.session_id,
+        user_id=request.user_id,
+        trace_name="chat",
+        metadata=request.metadata,
+    )
+    config = {"configurable": {"thread_id": request.session_id}}
+    if handler:
+        config["callbacks"] = [handler]
+    return config
 
 
 async def get_graph():
     """Get or create the compiled graph."""
     global _compiled_graph
-
     if _compiled_graph is None:
-        from graph import create_agent
-        from tools import get_all_tools
-        from guardrails import (
-            create_input_guardrail,
-            create_output_guardrail,
-            prompt_injection_check,
-            toxic_content_check,
-            pii_output_check,
-        )
-
         _compiled_graph = await create_agent(
             tools=get_all_tools(),
             langfuse_prompt_name="main-assistant",
-            pre_model_hook=create_input_guardrail([
-                prompt_injection_check,
-                toxic_content_check,
-            ]),
-            post_model_hook=create_output_guardrail([
-                pii_output_check,
-            ]),
+            pre_model_hook=create_input_guardrail([prompt_injection_check, toxic_content_check]),
+            post_model_hook=create_output_guardrail([pii_output_check]),
         )
-
     return _compiled_graph
 
 
@@ -111,53 +102,41 @@ async def chat(request: ChatRequest) -> ChatResponse:
         )
 
     graph = await get_graph()
-
-    langfuse_handler = create_trace_handler(
-        session_id=request.session_id,
-        user_id=request.user_id,
-        trace_name="chat",
-        metadata=request.metadata,
-    )
-
-    config = {"configurable": {"thread_id": request.session_id}}
-    if langfuse_handler:
-        config["callbacks"] = [langfuse_handler]
+    config = _create_invoke_config(request)
 
     try:
-        lc_messages = convert_messages_to_langchain(request.messages)
-        result = await graph.ainvoke({"messages": lc_messages}, config=config)
+        result = await graph.ainvoke(
+            {"messages": _to_langchain_messages(request.messages)},
+            config=config
+        )
 
-        messages = result.get("messages", [])
-        last_ai_message = None
-        for msg in reversed(messages):
-            if isinstance(msg, AIMessage):
-                last_ai_message = msg
-                break
-
-        content = last_ai_message.content if last_ai_message else ""
+        # Get last AI message
+        last_ai = next(
+            (m for m in reversed(result.get("messages", [])) if isinstance(m, AIMessage)),
+            None
+        )
 
         tool_calls = []
-        if last_ai_message and hasattr(last_ai_message, "tool_calls") and last_ai_message.tool_calls:
-            for tc in last_ai_message.tool_calls:
-                tool_calls.append(ToolCallInfo(
+        if last_ai and getattr(last_ai, "tool_calls", None):
+            tool_calls = [
+                ToolCallInfo(
                     id=tc.get("id", ""),
                     name=tc.get("name", ""),
                     arguments=tc.get("args", {}),
-                ))
+                )
+                for tc in last_ai.tool_calls
+            ]
 
         return ChatResponse(
             session_id=request.session_id,
-            content=content,
+            content=last_ai.content if last_ai else "",
             tool_calls=tool_calls,
             usage=TokenUsage(),
             metadata={"user_id": request.user_id},
         )
 
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e),
-        )
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
 @router.post("/stream")
@@ -166,29 +145,13 @@ async def stream(request: ChatRequest) -> StreamingResponse:
 
     async def event_generator() -> AsyncIterator[str]:
         graph = await get_graph()
-
-        langfuse_handler = create_trace_handler(
-            session_id=request.session_id,
-            user_id=request.user_id,
-            trace_name="stream",
-            metadata=request.metadata,
-        )
-
-        config = {"configurable": {"thread_id": request.session_id}}
-        if langfuse_handler:
-            config["callbacks"] = [langfuse_handler]
+        config = _create_invoke_config(request)
 
         try:
-            lc_messages = convert_messages_to_langchain(request.messages)
-
-            start_event = StreamEvent(
-                event="message_start",
-                data={"session_id": request.session_id},
-            )
-            yield f"data: {start_event.model_dump_json()}\n\n"
+            yield f"data: {StreamEvent(event='message_start', data={'session_id': request.session_id}).model_dump_json()}\n\n"
 
             async for event in graph.astream_events(
-                {"messages": lc_messages},
+                {"messages": _to_langchain_messages(request.messages)},
                 config=config,
                 version="v2",
             ):
@@ -196,52 +159,24 @@ async def stream(request: ChatRequest) -> StreamingResponse:
 
                 if event_type == "on_chat_model_stream":
                     chunk = event.get("data", {}).get("chunk")
-                    if chunk and hasattr(chunk, "content") and chunk.content:
-                        stream_event = StreamEvent(
-                            event="content_delta",
-                            data={"content": chunk.content},
-                        )
-                        yield f"data: {stream_event.model_dump_json()}\n\n"
+                    if chunk and getattr(chunk, "content", None):
+                        yield f"data: {StreamEvent(event='content_delta', data={'content': chunk.content}).model_dump_json()}\n\n"
 
                 elif event_type == "on_tool_start":
-                    tool_name = event.get("name", "unknown")
-                    tool_input = event.get("data", {}).get("input", {})
-                    stream_event = StreamEvent(
-                        event="tool_start",
-                        data={"tool": tool_name, "input": tool_input},
-                    )
-                    yield f"data: {stream_event.model_dump_json()}\n\n"
+                    yield f"data: {StreamEvent(event='tool_start', data={'tool': event.get('name', 'unknown'), 'input': event.get('data', {}).get('input', {})}).model_dump_json()}\n\n"
 
                 elif event_type == "on_tool_end":
-                    tool_name = event.get("name", "unknown")
-                    tool_output = event.get("data", {}).get("output", "")
-                    stream_event = StreamEvent(
-                        event="tool_end",
-                        data={"tool": tool_name, "output": str(tool_output)},
-                    )
-                    yield f"data: {stream_event.model_dump_json()}\n\n"
+                    yield f"data: {StreamEvent(event='tool_end', data={'tool': event.get('name', 'unknown'), 'output': str(event.get('data', {}).get('output', ''))}).model_dump_json()}\n\n"
 
-            end_event = StreamEvent(
-                event="message_end",
-                data={"session_id": request.session_id},
-            )
-            yield f"data: {end_event.model_dump_json()}\n\n"
+            yield f"data: {StreamEvent(event='message_end', data={'session_id': request.session_id}).model_dump_json()}\n\n"
 
         except Exception as e:
-            error_event = StreamEvent(
-                event="error",
-                data={"error": str(e)},
-            )
-            yield f"data: {error_event.model_dump_json()}\n\n"
+            yield f"data: {StreamEvent(event='error', data={'error': str(e)}).model_dump_json()}\n\n"
 
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
     )
 
 
@@ -255,25 +190,11 @@ async def health_check() -> dict[str, str]:
 async def list_agents() -> dict[str, Any]:
     """List all available agent configurations."""
     from agents.base import get_all_agents
-
-    agents = get_all_agents()
-    return {
-        "agents": [
-            {"name": a.name, "description": a.description}
-            for a in agents
-        ]
-    }
+    return {"agents": [{"name": a.name, "description": a.description} for a in get_all_agents()]}
 
 
 @router.get("/tools")
 async def list_tools() -> dict[str, Any]:
     """List all available tools."""
     from tools.base import get_all_tools
-
-    tools = get_all_tools()
-    return {
-        "tools": [
-            {"name": t.name, "description": t.description}
-            for t in tools
-        ]
-    }
+    return {"tools": [{"name": t.name, "description": t.description} for t in get_all_tools()]}

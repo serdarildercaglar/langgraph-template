@@ -127,13 +127,3 @@ def get_embedding_service() -> EmbeddingService:
     if _service is None:
         _service = EmbeddingService()
     return _service
-
-
-async def embed_text(text: str) -> list[float]:
-    """Convenience function to embed a single text."""
-    return await get_embedding_service().embed(text)
-
-
-async def embed_texts(texts: list[str]) -> list[list[float]]:
-    """Convenience function to embed multiple texts."""
-    return await get_embedding_service().embed_batch(texts)

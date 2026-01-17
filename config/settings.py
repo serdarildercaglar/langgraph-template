@@ -92,6 +92,14 @@ class CheckpointSettings(BaseSettings):
     postgres_uri: str = Field(default="")
 
 
+class AgentSettings(BaseSettings):
+    """Agent default settings."""
+
+    model_config = SettingsConfigDict(env_prefix="AGENT_")
+
+    default_prompt: str = Field(default="You are a helpful AI assistant.")
+
+
 class APISettings(BaseSettings):
     """FastAPI settings."""
 
@@ -121,6 +129,7 @@ class Settings(BaseSettings):
     milvus: MilvusSettings = Field(default_factory=MilvusSettings)
     langfuse: LangfuseSettings = Field(default_factory=LangfuseSettings)
     checkpoint: CheckpointSettings = Field(default_factory=CheckpointSettings)
+    agent: AgentSettings = Field(default_factory=AgentSettings)
     api: APISettings = Field(default_factory=APISettings)
 
     @property
